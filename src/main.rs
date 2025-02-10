@@ -5,6 +5,7 @@ use std::io::{BufRead, BufReader};
 use std::process::Command;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
+use std::thread;
 
 /// Fedora system updater that handles both Flatpak and DNF5 updates
 #[derive(Parser, Debug)]
@@ -28,6 +29,33 @@ fn is_command_available(command: &str) -> bool {
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false)
+}
+
+/// Handles a command's output stream in a separate thread
+fn handle_output_stream(
+    reader: BufReader<impl std::io::Read + Send + 'static>,
+    is_stderr: bool,
+    content: Option<Arc<Mutex<String>>>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        reader.lines().for_each(|line| {
+            if let Ok(line) = line {
+                // Store the line if we have a content buffer
+                if let Some(content) = &content {
+                    if let Ok(mut guard) = content.lock() {
+                        guard.push_str(&line);
+                        guard.push('\n');
+                    }
+                }
+                // Print to appropriate stream
+                if is_stderr {
+                    eprintln!("{}", line);
+                } else {
+                    println!("{}", line);
+                }
+            }
+        });
+    })
 }
 
 /// Executes a command and streams its output in real-time
@@ -58,23 +86,15 @@ fn execute_command(command: &str, args: &[&str], sudo: bool) -> Result<()> {
     let stdout_reader = BufReader::new(stdout);
     let stderr_reader = BufReader::new(stderr);
 
+    // Create a string to store stdout for later analysis
+    let stdout_content = Arc::new(Mutex::new(String::new()));
+    let stdout_content_clone = Arc::clone(&stdout_content);
+
     // Spawn a thread to handle stdout
-    let stdout_handle = std::thread::spawn(move || {
-        stdout_reader.lines().for_each(|line| {
-            if let Ok(line) = line {
-                println!("{}", line);
-            }
-        });
-    });
+    let stdout_handle = handle_output_stream(stdout_reader, false, Some(stdout_content_clone));
 
     // Spawn a thread to handle stderr
-    let stderr_handle = std::thread::spawn(move || {
-        stderr_reader.lines().for_each(|line| {
-            if let Ok(line) = line {
-                eprintln!("{}", line);
-            }
-        });
-    });
+    let stderr_handle = handle_output_stream(stderr_reader, true, None);
 
     // Wait for the command to complete
     let status = child.wait()?;
@@ -123,27 +143,10 @@ fn update_flatpak() -> Result<bool> {
     let stdout_content_clone = Arc::clone(&stdout_content);
 
     // Spawn a thread to handle stdout
-    let stdout_handle = std::thread::spawn(move || {
-        stdout_reader.lines().for_each(|line| {
-            if let Ok(line) = line {
-                // Store the line for later analysis
-                if let Ok(mut content) = stdout_content_clone.lock() {
-                    content.push_str(&line);
-                    content.push('\n');
-                }
-                println!("{}", line);
-            }
-        });
-    });
+    let stdout_handle = handle_output_stream(stdout_reader, false, Some(stdout_content_clone));
 
     // Spawn a thread to handle stderr
-    let stderr_handle = std::thread::spawn(move || {
-        stderr_reader.lines().for_each(|line| {
-            if let Ok(line) = line {
-                eprintln!("{}", line);
-            }
-        });
-    });
+    let stderr_handle = handle_output_stream(stderr_reader, true, None);
 
     // Wait for the command to complete
     let status = child.wait()?;
@@ -198,22 +201,10 @@ fn update_dnf5(interactive: bool) -> Result<bool> {
     let stderr_reader = BufReader::new(stderr);
 
     // Handle stdout
-    let stdout_handle = std::thread::spawn(move || {
-        stdout_reader.lines().for_each(|line| {
-            if let Ok(line) = line {
-                println!("{}", line);
-            }
-        });
-    });
+    let stdout_handle = handle_output_stream(stdout_reader, false, None);
 
     // Handle stderr
-    let stderr_handle = std::thread::spawn(move || {
-        stderr_reader.lines().for_each(|line| {
-            if let Ok(line) = line {
-                eprintln!("{}", line);
-            }
-        });
-    });
+    let stderr_handle = handle_output_stream(stderr_reader, true, None);
 
     // Wait for the command to complete
     let status = check_result.wait()?;
