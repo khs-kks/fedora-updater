@@ -101,20 +101,24 @@ fn update_flatpak() -> Result<bool> {
 
     println!("{}", "Updating Flatpak packages...".green());
 
-    // Run flatpak update with -y flag to automatically accept updates
-    let status = execute_command("flatpak", &["update", "-y"], false);
+    // Run flatpak update with -y flag and capture output
+    let output = Command::new("flatpak")
+        .args(["update", "-y"])
+        .output()
+        .with_context(|| "Failed to execute flatpak update")?;
 
-    // Exit code 77 means no updates were available
-    match status {
-        Ok(_) => Ok(true),
-        Err(e) => {
-            if e.to_string().contains("exit code: 77") {
-                Ok(false)
-            } else {
-                Err(e)
-            }
-        }
+    // Convert output to string for checking
+    let output_str = String::from_utf8_lossy(&output.stdout);
+
+    // Print the output
+    println!("{}", output_str);
+
+    if !output.status.success() {
+        return Err(anyhow::anyhow!("Flatpak update failed"));
     }
+
+    // Return true only if updates were performed (output doesn't contain "Nothing to do")
+    Ok(!output_str.contains("Nothing to do"))
 }
 
 /// Handles DNF5 updates
