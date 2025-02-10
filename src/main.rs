@@ -7,7 +7,13 @@ use std::process::Stdio;
 
 /// Fedora system updater that handles both Flatpak and DNF5 updates
 #[derive(Parser, Debug)]
-#[command(author, version, about)]
+#[command(
+    author = "khs-kks",
+    version,
+    about = "A command-line utility to update Fedora systems through Flatpak and DNF5",
+    after_help = "Repository: https://github.com/khs-kks/fedora-updater\nBuild Date: Feb 2025",
+    help_template = "{about}\n\nUsage: {name} [OPTIONS]\n\nOptions:\n{options}\n\nAuthor: {author}{after-help}"
+)]
 struct Cli {
     /// Enable interactive mode for choosing update type
     #[arg(short, long)]
