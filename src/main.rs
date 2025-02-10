@@ -124,21 +124,56 @@ fn update_dnf5(interactive: bool) -> Result<bool> {
     println!("{}", "Checking for DNF5 updates...".green());
 
     // Check for updates - exit code 100 means updates are available
-    match Command::new("sudo")
+    let mut check_result = Command::new("sudo")
         .args(["dnf5", "--refresh", "check-upgrade"])
-        .status()
-    {
-        Ok(status) => {
-            let has_updates = status.code() == Some(100);
-            if !has_updates {
-                println!("{}", "No DNF5 updates available.".green());
-                return Ok(false);
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| "Failed to execute dnf5 check-upgrade")?;
+
+    // Get handles to stdout and stderr
+    let stdout = check_result
+        .stdout
+        .take()
+        .expect("Failed to capture stdout");
+    let stderr = check_result
+        .stderr
+        .take()
+        .expect("Failed to capture stderr");
+
+    // Create readers for stdout and stderr
+    let stdout_reader = BufReader::new(stdout);
+    let stderr_reader = BufReader::new(stderr);
+
+    // Handle stdout
+    let stdout_handle = std::thread::spawn(move || {
+        stdout_reader.lines().for_each(|line| {
+            if let Ok(line) = line {
+                println!("{}", line);
             }
-        }
-        Err(e) => {
-            println!("{}", "Failed to check for DNF5 updates.".red());
-            return Err(e.into());
-        }
+        });
+    });
+
+    // Handle stderr
+    let stderr_handle = std::thread::spawn(move || {
+        stderr_reader.lines().for_each(|line| {
+            if let Ok(line) = line {
+                eprintln!("{}", line);
+            }
+        });
+    });
+
+    // Wait for the command to complete
+    let status = check_result.wait()?;
+
+    // Wait for output threads to finish
+    stdout_handle.join().expect("Failed to join stdout thread");
+    stderr_handle.join().expect("Failed to join stderr thread");
+
+    let has_updates = status.code() == Some(100);
+    if !has_updates {
+        println!("{}", "No DNF5 updates available.".green());
+        return Ok(false);
     }
 
     println!("{}", "DNF5 updates are available.".green());
