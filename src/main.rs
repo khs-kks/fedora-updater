@@ -201,18 +201,10 @@ fn update_dnf5(interactive: bool) -> Result<bool> {
             execute_command("dnf5", &["upgrade", "-y"], true)?;
 
             // Check if reboot is needed
-            match Command::new("sudo")
-                .args(["dnf5", "needs-restarting"])
-                .status()
-            {
-                Ok(status) => {
-                    let needs_restart = status.code().unwrap_or(0) == 1;
-                    if needs_restart {
-                        println!(
-                            "{}",
-                            "System restart is required to complete updates.".yellow()
-                        );
-                    }
+            match execute_command("dnf5", &["needs-restarting"], true) {
+                Ok(_) => {
+                    // needs-restarting already printed its output
+                    // No need to show additional message as the command itself is clear
                 }
                 Err(e) => {
                     println!(
