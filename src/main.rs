@@ -24,7 +24,7 @@ struct Cli {
 }
 
 /// Struct to manage command availability caching
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct CommandCache {
     cache: HashMap<String, bool>,
 }
