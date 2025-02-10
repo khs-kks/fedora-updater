@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use colored::*;
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::process::Command;
 use std::process::Stdio;
@@ -22,13 +23,42 @@ struct Cli {
     interactive: bool,
 }
 
-/// Checks if a command is available in the system
-fn is_command_available(command: &str) -> bool {
-    Command::new("which")
-        .arg(command)
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+/// Struct to manage command availability caching
+#[derive(Debug, Default)]
+struct CommandCache {
+    cache: HashMap<String, bool>,
+}
+
+impl CommandCache {
+    fn new() -> Self {
+        Self {
+            cache: HashMap::new(),
+        }
+    }
+
+    /// Checks if a command is available, using cached results if available
+    fn is_command_available(&mut self, command: &str) -> bool {
+        *self.cache.entry(command.to_string()).or_insert_with(|| {
+            Command::new("which")
+                .arg(command)
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        })
+    }
+
+    /// Executes a command if it's available, returns None if command is not available
+    fn execute_if_available(
+        &mut self,
+        command: &str,
+        args: &[&str],
+    ) -> Option<std::process::Output> {
+        if self.is_command_available(command) {
+            Command::new(command).args(args).output().ok()
+        } else {
+            None
+        }
+    }
 }
 
 /// Handles a command's output stream in a separate thread
@@ -110,9 +140,48 @@ fn execute_command(command: &str, args: &[&str], sudo: bool) -> Result<()> {
     }
 }
 
+/// Displays system information
+fn show_system_info(cmd_cache: &mut CommandCache) -> Result<()> {
+    println!("{}", "System Information:".blue().bold());
+
+    // Distribution info
+    if let Ok(output) = Command::new("cat").arg("/etc/os-release").output() {
+        let info = String::from_utf8_lossy(&output.stdout);
+        if let Some(line) = info.lines().find(|l| l.starts_with("PRETTY_NAME=")) {
+            println!(
+                "Distribution: {}",
+                line.split('=')
+                    .nth(1)
+                    .unwrap_or("Unknown")
+                    .trim_matches('"')
+            );
+        }
+    }
+
+    // Kernel version
+    if let Ok(output) = Command::new("uname").arg("-r").output() {
+        println!("Kernel: {}", String::from_utf8_lossy(&output.stdout).trim());
+    }
+
+    // Flatpak version
+    if let Some(output) = cmd_cache.execute_if_available("flatpak", &["--version"]) {
+        println!(
+            "Flatpak: {}",
+            String::from_utf8_lossy(&output.stdout).trim()
+        );
+    }
+
+    // DNF5 version
+    if let Some(output) = cmd_cache.execute_if_available("dnf5", &["--version"]) {
+        print!("DNF5: {}", String::from_utf8_lossy(&output.stdout));
+    }
+
+    Ok(())
+}
+
 /// Handles Flatpak updates
-fn update_flatpak() -> Result<bool> {
-    if !is_command_available("flatpak") {
+fn update_flatpak(cmd_cache: &mut CommandCache) -> Result<bool> {
+    if !cmd_cache.is_command_available("flatpak") {
         println!(
             "{}",
             "Flatpak is not installed. Skipping Flatpak updates.".yellow()
@@ -167,8 +236,8 @@ fn update_flatpak() -> Result<bool> {
 }
 
 /// Handles DNF5 updates
-fn update_dnf5(interactive: bool) -> Result<bool> {
-    if !is_command_available("dnf5") {
+fn update_dnf5(cmd_cache: &mut CommandCache, interactive: bool) -> Result<bool> {
+    if !cmd_cache.is_command_available("dnf5") {
         println!(
             "{}",
             "DNF5 is not installed. Please install it first.".red()
@@ -272,62 +341,18 @@ fn update_dnf5(interactive: bool) -> Result<bool> {
     Ok(true)
 }
 
-/// Displays system information
-fn show_system_info() -> Result<()> {
-    println!("{}", "System Information:".blue().bold());
-
-    // Distribution info
-    if let Ok(output) = Command::new("cat").arg("/etc/os-release").output() {
-        let info = String::from_utf8_lossy(&output.stdout);
-        if let Some(line) = info.lines().find(|l| l.starts_with("PRETTY_NAME=")) {
-            println!(
-                "Distribution: {}",
-                line.split('=')
-                    .nth(1)
-                    .unwrap_or("Unknown")
-                    .trim_matches('"')
-            );
-        }
-    }
-
-    // Kernel version
-    if let Ok(output) = Command::new("uname").arg("-r").output() {
-        println!("Kernel: {}", String::from_utf8_lossy(&output.stdout).trim());
-    }
-
-    // Flatpak version
-    if is_command_available("flatpak") {
-        if let Ok(output) = Command::new("flatpak").arg("--version").output() {
-            println!(
-                "Flatpak: {}",
-                String::from_utf8_lossy(&output.stdout).trim()
-            );
-        }
-    }
-
-    // DNF5 version - show complete output
-    if is_command_available("dnf5") {
-        if let Ok(output) = Command::new("dnf5").arg("--version").output() {
-            // Print all lines of DNF5 version info
-            let version_info = String::from_utf8_lossy(&output.stdout);
-            print!("DNF5: {}", version_info);
-        }
-    }
-
-    Ok(())
-}
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let mut cmd_cache = CommandCache::new();
 
     println!("{}", "Fedora Updater".green().bold());
     println!("─────────────────────────────\n");
 
-    show_system_info()?;
+    show_system_info(&mut cmd_cache)?;
     println!("\n{}", "Starting update process...".green());
 
-    let flatpak_result = update_flatpak();
-    let dnf5_result = update_dnf5(cli.interactive);
+    let flatpak_result = update_flatpak(&mut cmd_cache);
+    let dnf5_result = update_dnf5(&mut cmd_cache, cli.interactive);
 
     match (flatpak_result, dnf5_result) {
         (Ok(flatpak_updated), Ok(dnf_updated)) => {
