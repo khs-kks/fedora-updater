@@ -4,6 +4,7 @@ use colored::*;
 use std::io::{BufRead, BufReader};
 use std::process::Command;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 
 /// Fedora system updater that handles both Flatpak and DNF5 updates
 #[derive(Parser, Debug)]
@@ -101,24 +102,65 @@ fn update_flatpak() -> Result<bool> {
 
     println!("{}", "Updating Flatpak packages...".green());
 
-    // Run flatpak update with -y flag and capture output
-    let output = Command::new("flatpak")
+    // Run flatpak update with -y flag and stream output
+    let mut child = Command::new("flatpak")
         .args(["update", "-y"])
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .with_context(|| "Failed to execute flatpak update")?;
 
-    // Convert output to string for checking
-    let output_str = String::from_utf8_lossy(&output.stdout);
+    // Get handles to stdout and stderr
+    let stdout = child.stdout.take().expect("Failed to capture stdout");
+    let stderr = child.stderr.take().expect("Failed to capture stderr");
 
-    // Print the output
-    println!("{}", output_str);
+    // Create readers for stdout and stderr
+    let stdout_reader = BufReader::new(stdout);
+    let stderr_reader = BufReader::new(stderr);
 
-    if !output.status.success() {
+    // Create a string to store stdout for later analysis
+    let stdout_content = Arc::new(Mutex::new(String::new()));
+    let stdout_content_clone = Arc::clone(&stdout_content);
+
+    // Spawn a thread to handle stdout
+    let stdout_handle = std::thread::spawn(move || {
+        stdout_reader.lines().for_each(|line| {
+            if let Ok(line) = line {
+                // Store the line for later analysis
+                if let Ok(mut content) = stdout_content_clone.lock() {
+                    content.push_str(&line);
+                    content.push('\n');
+                }
+                println!("{}", line);
+            }
+        });
+    });
+
+    // Spawn a thread to handle stderr
+    let stderr_handle = std::thread::spawn(move || {
+        stderr_reader.lines().for_each(|line| {
+            if let Ok(line) = line {
+                eprintln!("{}", line);
+            }
+        });
+    });
+
+    // Wait for the command to complete
+    let status = child.wait()?;
+
+    // Wait for output threads to finish
+    stdout_handle.join().expect("Failed to join stdout thread");
+    stderr_handle.join().expect("Failed to join stderr thread");
+
+    if !status.success() {
         return Err(anyhow::anyhow!("Flatpak update failed"));
     }
 
-    // Return true only if updates were performed (output doesn't contain "Nothing to do")
-    Ok(!output_str.contains("Nothing to do"))
+    // Check the captured output to determine if updates were performed
+    let output_content = stdout_content
+        .lock()
+        .expect("Failed to access stdout content");
+    Ok(!output_content.contains("Nothing to do"))
 }
 
 /// Handles DNF5 updates
