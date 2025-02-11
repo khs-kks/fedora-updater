@@ -1,6 +1,6 @@
 [package]
 name = "fedora-updater"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 authors = ["khs-kks"]
 repository = "https://github.com/khs-kks/fedora-updater"
@@ -8,5 +8,6 @@ description = "A command-line utility to update Fedora systems through Flatpak a
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
+tokio = { version = "1.43", features = ["full"] }
 anyhow = "1.0"
 colored = "=3.0.0"
