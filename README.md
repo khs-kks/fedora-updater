@@ -82,3 +82,6 @@ The program provides clear, color-coded output:
 - 🟡 Yellow: Warnings and important notifications
 - 🔴 Red: Error messages
 
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
