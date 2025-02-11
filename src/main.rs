@@ -4,11 +4,11 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use colored::*;
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
-use std::process::Command;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use std::thread;
+use tokio::io::AsyncRead;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command;
 
 /// Fedora system updater that handles both Flatpak and DNF5 updates
 #[derive(Parser, Debug)]
@@ -39,59 +39,69 @@ impl CommandCache {
     }
 
     /// Checks if a command is available, using cached results if available
-    fn is_command_available(&mut self, command: &str) -> bool {
-        *self.cache.entry(command.to_string()).or_insert_with(|| {
-            Command::new("which")
-                .arg(command)
-                .output()
-                .map(|output| output.status.success())
-                .unwrap_or(false)
-        })
+    async fn is_command_available(&mut self, command: &str) -> bool {
+        if let Some(&available) = self.cache.get(command) {
+            return available;
+        }
+
+        let available = Command::new("which")
+            .arg(command)
+            .output()
+            .await
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+
+        self.cache.insert(command.to_string(), available);
+        available
     }
 
     /// Executes a command if it's available, returns None if command is not available
-    fn execute_if_available(
+    async fn execute_if_available(
         &mut self,
         command: &str,
         args: &[&str],
     ) -> Option<std::process::Output> {
-        if self.is_command_available(command) {
-            Command::new(command).args(args).output().ok()
+        if self.is_command_available(command).await {
+            Command::new(command).args(args).output().await.ok()
         } else {
             None
         }
     }
 }
 
-/// Handles a command's output stream in a separate thread
-fn handle_output_stream(
-    reader: BufReader<impl std::io::Read + Send + 'static>,
+/// Handles a command's output stream asynchronously
+async fn handle_output_stream<R>(
+    reader: BufReader<R>,
     is_stderr: bool,
     content: Option<Arc<Mutex<String>>>,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        reader.lines().for_each(|line| {
-            if let Ok(line) = line {
-                // Store the line if we have a content buffer
-                if let Some(content) = &content {
-                    if let Ok(mut guard) = content.lock() {
-                        guard.push_str(&line);
-                        guard.push('\n');
-                    }
-                }
-                // Print to appropriate stream
-                if is_stderr {
-                    eprintln!("{}", line);
-                } else {
-                    println!("{}", line);
-                }
+) where
+    R: AsyncRead + Unpin,
+{
+    let mut lines = reader.lines();
+
+    while let Ok(Some(line)) = lines.next_line().await {
+        // Store the line if we have a content buffer
+        if let Some(content) = &content {
+            if let Ok(mut guard) = content.lock() {
+                guard.push_str(&line);
+                guard.push('\n');
             }
-        });
-    })
+        }
+        // Print to appropriate stream
+        if is_stderr {
+            eprintln!("{}", line);
+        } else {
+            println!("{}", line);
+        }
+    }
 }
 
 /// Executes a command and streams its output in real-time
-fn execute_command(command: &str, args: &[&str], sudo: bool) -> Result<()> {
+async fn execute_command(
+    command: &str,
+    args: &[&str],
+    sudo: bool,
+) -> Result<(std::process::ExitStatus, String)> {
     let mut cmd = if sudo {
         let mut c = Command::new("sudo");
         c.arg(command);
@@ -122,32 +132,35 @@ fn execute_command(command: &str, args: &[&str], sudo: bool) -> Result<()> {
     let stdout_content = Arc::new(Mutex::new(String::new()));
     let stdout_content_clone = Arc::clone(&stdout_content);
 
-    // Spawn a thread to handle stdout
-    let stdout_handle = handle_output_stream(stdout_reader, false, Some(stdout_content_clone));
-
-    // Spawn a thread to handle stderr
-    let stderr_handle = handle_output_stream(stderr_reader, true, None);
+    // Spawn tasks to handle stdout and stderr
+    let stdout_handle = tokio::spawn(handle_output_stream(
+        stdout_reader,
+        false,
+        Some(stdout_content_clone),
+    ));
+    let stderr_handle = tokio::spawn(handle_output_stream(stderr_reader, true, None));
 
     // Wait for the command to complete
-    let status = child.wait()?;
+    let status = child.wait().await?;
 
-    // Wait for output threads to finish
-    stdout_handle.join().expect("Failed to join stdout thread");
-    stderr_handle.join().expect("Failed to join stderr thread");
+    // Wait for output tasks to finish
+    let _ = tokio::try_join!(stdout_handle, stderr_handle)?;
 
-    if status.success() {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!("{} command failed", command))
-    }
+    // Get the captured output
+    let output = stdout_content
+        .lock()
+        .expect("Failed to access stdout content")
+        .clone();
+
+    Ok((status, output))
 }
 
 /// Displays system information
-fn show_system_info(cmd_cache: &mut CommandCache) -> Result<()> {
+async fn show_system_info(cmd_cache: &mut CommandCache) -> Result<()> {
     println!("{}", "System Information:".blue().bold());
 
     // Distribution info
-    if let Ok(output) = Command::new("cat").arg("/etc/os-release").output() {
+    if let Ok(output) = Command::new("cat").arg("/etc/os-release").output().await {
         let info = String::from_utf8_lossy(&output.stdout);
         if let Some(line) = info.lines().find(|l| l.starts_with("PRETTY_NAME=")) {
             println!(
@@ -161,12 +174,15 @@ fn show_system_info(cmd_cache: &mut CommandCache) -> Result<()> {
     }
 
     // Kernel version
-    if let Ok(output) = Command::new("uname").arg("-r").output() {
+    if let Ok(output) = Command::new("uname").arg("-r").output().await {
         println!("Kernel: {}", String::from_utf8_lossy(&output.stdout).trim());
     }
 
     // Flatpak version
-    if let Some(output) = cmd_cache.execute_if_available("flatpak", &["--version"]) {
+    if let Some(output) = cmd_cache
+        .execute_if_available("flatpak", &["--version"])
+        .await
+    {
         println!(
             "Flatpak: {}",
             String::from_utf8_lossy(&output.stdout).trim()
@@ -174,7 +190,7 @@ fn show_system_info(cmd_cache: &mut CommandCache) -> Result<()> {
     }
 
     // DNF5 version
-    if let Some(output) = cmd_cache.execute_if_available("dnf5", &["--version"]) {
+    if let Some(output) = cmd_cache.execute_if_available("dnf5", &["--version"]).await {
         print!("DNF5: {}", String::from_utf8_lossy(&output.stdout));
     }
 
@@ -182,8 +198,8 @@ fn show_system_info(cmd_cache: &mut CommandCache) -> Result<()> {
 }
 
 /// Handles Flatpak updates
-fn update_flatpak(cmd_cache: &mut CommandCache) -> Result<bool> {
-    if !cmd_cache.is_command_available("flatpak") {
+async fn update_flatpak(cmd_cache: &mut CommandCache) -> Result<bool> {
+    if !cmd_cache.is_command_available("flatpak").await {
         println!(
             "{}",
             "Flatpak is not installed. Skipping Flatpak updates.".yellow()
@@ -193,53 +209,19 @@ fn update_flatpak(cmd_cache: &mut CommandCache) -> Result<bool> {
 
     println!("{}", "Updating Flatpak packages...".green());
 
-    // Run flatpak update with -y flag and stream output
-    let mut child = Command::new("flatpak")
-        .args(["update", "-y"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| "Failed to execute flatpak update")?;
-
-    // Get handles to stdout and stderr
-    let stdout = child.stdout.take().expect("Failed to capture stdout");
-    let stderr = child.stderr.take().expect("Failed to capture stderr");
-
-    // Create readers for stdout and stderr
-    let stdout_reader = BufReader::new(stdout);
-    let stderr_reader = BufReader::new(stderr);
-
-    // Create a string to store stdout for later analysis
-    let stdout_content = Arc::new(Mutex::new(String::new()));
-    let stdout_content_clone = Arc::clone(&stdout_content);
-
-    // Spawn a thread to handle stdout
-    let stdout_handle = handle_output_stream(stdout_reader, false, Some(stdout_content_clone));
-
-    // Spawn a thread to handle stderr
-    let stderr_handle = handle_output_stream(stderr_reader, true, None);
-
-    // Wait for the command to complete
-    let status = child.wait()?;
-
-    // Wait for output threads to finish
-    stdout_handle.join().expect("Failed to join stdout thread");
-    stderr_handle.join().expect("Failed to join stderr thread");
+    let (status, output) = execute_command("flatpak", &["update", "-y"], false).await?;
 
     if !status.success() {
         return Err(anyhow::anyhow!("Flatpak update failed"));
     }
 
-    // Check the captured output to determine if updates were performed
-    let output_content = stdout_content
-        .lock()
-        .expect("Failed to access stdout content");
-    Ok(!output_content.contains("Nothing to do"))
+    // Check if there were any updates
+    Ok(!output.contains("Nothing to do"))
 }
 
 /// Handles DNF5 updates
-fn update_dnf5(cmd_cache: &mut CommandCache, interactive: bool) -> Result<bool> {
-    if !cmd_cache.is_command_available("dnf5") {
+async fn update_dnf5(cmd_cache: &mut CommandCache, interactive: bool) -> Result<bool> {
+    if !cmd_cache.is_command_available("dnf5").await {
         println!(
             "{}",
             "DNF5 is not installed. Please install it first.".red()
@@ -250,39 +232,7 @@ fn update_dnf5(cmd_cache: &mut CommandCache, interactive: bool) -> Result<bool> 
     println!("{}", "Checking for DNF5 updates...".green());
 
     // Check for updates - exit code 100 means updates are available
-    let mut check_result = Command::new("sudo")
-        .args(["dnf5", "--refresh", "check-upgrade"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| "Failed to execute dnf5 check-upgrade")?;
-
-    // Get handles to stdout and stderr
-    let stdout = check_result
-        .stdout
-        .take()
-        .expect("Failed to capture stdout");
-    let stderr = check_result
-        .stderr
-        .take()
-        .expect("Failed to capture stderr");
-
-    // Create readers for stdout and stderr
-    let stdout_reader = BufReader::new(stdout);
-    let stderr_reader = BufReader::new(stderr);
-
-    // Handle stdout
-    let stdout_handle = handle_output_stream(stdout_reader, false, None);
-
-    // Handle stderr
-    let stderr_handle = handle_output_stream(stderr_reader, true, None);
-
-    // Wait for the command to complete
-    let status = check_result.wait()?;
-
-    // Wait for output threads to finish
-    stdout_handle.join().expect("Failed to join stdout thread");
-    stderr_handle.join().expect("Failed to join stderr thread");
+    let (status, _) = execute_command("dnf5", &["--refresh", "check-upgrade"], true).await?;
 
     let has_updates = status.code() == Some(100);
     if !has_updates {
@@ -312,10 +262,13 @@ fn update_dnf5(cmd_cache: &mut CommandCache, interactive: bool) -> Result<bool> 
     match update_mode {
         "immediate" => {
             println!("{}", "Performing immediate DNF5 update...".green());
-            execute_command("dnf5", &["upgrade", "-y"], true)?;
+            let (status, _) = execute_command("dnf5", &["upgrade", "-y"], true).await?;
+            if !status.success() {
+                return Err(anyhow::anyhow!("DNF5 update failed"));
+            }
 
             // Check if reboot is needed
-            match execute_command("dnf5", &["needs-restarting"], true) {
+            match execute_command("dnf5", &["needs-restarting"], true).await {
                 Ok(_) => {
                     // needs-restarting already printed its output
                     // No need to show additional message as the command itself is clear
@@ -331,7 +284,11 @@ fn update_dnf5(cmd_cache: &mut CommandCache, interactive: bool) -> Result<bool> 
         }
         "offline" => {
             println!("{}", "Preparing offline DNF5 update...".green());
-            execute_command("dnf5", &["upgrade", "--offline", "-y"], true)?;
+            let (status, _) =
+                execute_command("dnf5", &["upgrade", "--offline", "-y"], true).await?;
+            if !status.success() {
+                return Err(anyhow::anyhow!("DNF5 offline update preparation failed"));
+            }
             println!(
                 "{}",
                 "Offline update prepared. Changes will be applied on next reboot.".yellow()
@@ -343,23 +300,27 @@ fn update_dnf5(cmd_cache: &mut CommandCache, interactive: bool) -> Result<bool> 
     Ok(true)
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
     let mut cmd_cache = CommandCache::new();
 
     println!("{}", "Fedora Updater".green().bold());
     println!("─────────────────────────────\n");
 
-    show_system_info(&mut cmd_cache)?;
+    show_system_info(&mut cmd_cache).await?;
     println!("\n{}", "Starting update process...".green());
 
-    let flatpak_result = update_flatpak(&mut cmd_cache);
-    let dnf5_result = update_dnf5(&mut cmd_cache, cli.interactive);
+    let flatpak_result = update_flatpak(&mut cmd_cache).await;
+    let dnf5_result = update_dnf5(&mut cmd_cache, cli.interactive).await;
 
     match (flatpak_result, dnf5_result) {
         (Ok(flatpak_updated), Ok(dnf_updated)) => {
             if flatpak_updated || dnf_updated {
-                println!("{}", "\nAll updates completed successfully!".green().bold())
+                println!(
+                    "{}",
+                    "\nUpdates were successfully installed!".green().bold()
+                )
             } else {
                 println!(
                     "{}",
