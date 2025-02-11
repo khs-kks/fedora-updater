@@ -87,11 +87,11 @@ async fn handle_output_stream<R>(
                 guard.push('\n');
             }
         }
-        // Print to appropriate stream
+        // Print to appropriate stream with prefix
         if is_stderr {
-            eprintln!("{}", line);
+            eprintln!("{} {}", "[stderr]".red(), line);
         } else {
-            println!("{}", line);
+            println!("{} {}", "[stdout]".blue(), line);
         }
     }
 }
