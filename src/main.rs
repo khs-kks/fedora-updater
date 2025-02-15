@@ -62,6 +62,10 @@ impl CommandCache {
         args: &[&str],
     ) -> Option<std::process::Output> {
         if self.is_command_available(command).await {
+            // Log the command that's about to be executed
+            let cmd_str = format!("{} {}", command, args.join(" "));
+            println!("{} {}", "Executing command:".cyan().bold(), cmd_str.cyan());
+
             Command::new(command).args(args).output().await.ok()
         } else {
             None
@@ -102,6 +106,14 @@ async fn execute_command(
     args: &[&str],
     sudo: bool,
 ) -> Result<(std::process::ExitStatus, String)> {
+    // Log the command that's about to be executed
+    let cmd_str = if sudo {
+        format!("sudo {} {}", command, args.join(" "))
+    } else {
+        format!("{} {}", command, args.join(" "))
+    };
+    println!("{} {}", "Executing command:".cyan().bold(), cmd_str.cyan());
+
     let mut cmd = if sudo {
         let mut c = Command::new("sudo");
         c.arg(command);
