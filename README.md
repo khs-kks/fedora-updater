@@ -82,6 +82,18 @@ The program provides clear, color-coded output:
 - 🟡 Yellow: Warnings and important notifications
 - 🔴 Red: Error messages
 
+## TODO
+
+### Known Issues
+- **Output Interleaving**: There's currently a race condition where stderr and stdout outputs can interleave, particularly noticeable during package updates. For example:
+  ```
+  [stderr] Total size of inbound packages is 158 MiB. Need to download 158 MiB.
+  [stdout]    replacing libreoffice-help-en          x86_64 1:24.8.4.2-2.fc41 @stored_transaction  28.5 MiB
+  [stderr][stdout]  libreoffice-impress                      x86_64 1:24.8.4.2-3.fc41 updates             806.6 KiB
+   After this operation, 4 MiB extra will be used (install 409 MiB, remove 405 MiB).[stdout]    replacing libreoffice-impress          x86_64 1:24.8.4.2-2.fc41 @stored_transaction 797.1 KiB
+  ```
+  This will be addressed in a future update to ensure clean, non-interleaved output.
+
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
