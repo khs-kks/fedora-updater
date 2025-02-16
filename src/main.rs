@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use tokio::io::AsyncRead;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+use tokio::sync::mpsc;
 
 /// Fedora system updater that handles both Flatpak and DNF5 updates
 #[derive(Parser, Debug)]
@@ -73,11 +74,29 @@ impl CommandCache {
     }
 }
 
+/// Represents a single line of output from a command
+#[derive(Debug)]
+enum OutputMessage {
+    Stdout(String),
+    Stderr(String),
+}
+
+/// Handles printing output messages in a serialized manner
+async fn output_handler(mut rx: mpsc::Receiver<OutputMessage>) {
+    while let Some(message) = rx.recv().await {
+        match message {
+            OutputMessage::Stdout(line) => println!("{} {}", "[stdout]".blue(), line),
+            OutputMessage::Stderr(line) => eprintln!("{} {}", "[stderr]".red(), line),
+        }
+    }
+}
+
 /// Handles a command's output stream asynchronously
 async fn handle_output_stream<R>(
     reader: BufReader<R>,
     is_stderr: bool,
     content: Option<Arc<Mutex<String>>>,
+    tx: mpsc::Sender<OutputMessage>,
 ) where
     R: AsyncRead + Unpin,
 {
@@ -91,12 +110,16 @@ async fn handle_output_stream<R>(
                 guard.push('\n');
             }
         }
-        // Print to appropriate stream with prefix
-        if is_stderr {
-            eprintln!("{} {}", "[stderr]".red(), line);
+
+        // Send the line to our output handler
+        let message = if is_stderr {
+            OutputMessage::Stderr(line)
         } else {
-            println!("{} {}", "[stdout]".blue(), line);
-        }
+            OutputMessage::Stdout(line)
+        };
+
+        // Ignore send errors (happens when receiver is dropped)
+        let _ = tx.send(message).await;
     }
 }
 
@@ -144,19 +167,34 @@ async fn execute_command(
     let stdout_content = Arc::new(Mutex::new(String::new()));
     let stdout_content_clone = Arc::clone(&stdout_content);
 
+    // Create channel for output handling
+    let (tx, rx) = mpsc::channel(100); // Buffer size of 100 messages
+    let tx_stdout = tx.clone();
+    let tx_stderr = tx.clone();
+
+    // Spawn the output handler task
+    let output_handler_task = tokio::spawn(output_handler(rx));
+
     // Spawn tasks to handle stdout and stderr
     let stdout_handle = tokio::spawn(handle_output_stream(
         stdout_reader,
         false,
         Some(stdout_content_clone),
+        tx_stdout,
     ));
-    let stderr_handle = tokio::spawn(handle_output_stream(stderr_reader, true, None));
+    let stderr_handle = tokio::spawn(handle_output_stream(stderr_reader, true, None, tx_stderr));
+
+    // Drop the original sender so the output handler will exit when stdout/stderr tasks complete
+    drop(tx);
 
     // Wait for the command to complete
     let status = child.wait().await?;
 
     // Wait for output tasks to finish
     let _ = tokio::try_join!(stdout_handle, stderr_handle)?;
+
+    // Wait for output handler to finish
+    let _ = output_handler_task.await?;
 
     // Get the captured output
     let output = stdout_content
