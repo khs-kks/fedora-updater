@@ -194,7 +194,7 @@ async fn execute_command(
     let _ = tokio::try_join!(stdout_handle, stderr_handle)?;
 
     // Wait for output handler to finish
-    let _ = output_handler_task.await?;
+    output_handler_task.await?;
 
     // Get the captured output
     let output = stdout_content
