@@ -39,12 +39,61 @@ impl CommandCache {
         }
     }
 
-    /// Checks if a command is available, using cached results if available
+    /// Preloads availability of commonly used commands
+    /// Call this at startup to avoid async overhead during actual operations
+    async fn preload_common_commands(&mut self) {
+        // List of commonly used commands in this application
+        // Using 'static str to avoid temporary allocations
+        static COMMON_COMMANDS: [&str; 4] = ["flatpak", "dnf5", "cat", "uname"];
+
+        // Check commands concurrently with minimum allocations
+        let mut handles = Vec::with_capacity(COMMON_COMMANDS.len());
+
+        for &cmd in &COMMON_COMMANDS {
+            // Spawn a task for each command
+            let handle = tokio::spawn(async move {
+                let available = Command::new("which")
+                    .arg(cmd) // Pass &str directly
+                    .output()
+                    .await
+                    .map(|output| output.status.success())
+                    .unwrap_or(false);
+                (cmd, available)
+            });
+
+            handles.push(handle);
+        }
+
+        // Await all tasks and collect results
+        for handle in handles {
+            if let Ok((cmd, available)) = handle.await {
+                // We only allocate strings when we need to store them in the cache
+                self.cache.insert(cmd.to_string(), available);
+            }
+        }
+    }
+
+    /// Checks if a command is cached as available
+    fn is_cached_available(&self, command: &str) -> Option<bool> {
+        self.cache.get(command).copied()
+    }
+
+    /// Gets the availability of a command, returning immediately if cached
+    /// This is a convenience method to avoid needing .await when we already know the result
+    /// Returns None if the result isn't cached yet
+    fn get_cached_availability(&self, command: &str) -> Option<bool> {
+        self.is_cached_available(command)
+    }
+
+    /// Checks if a command is available
+    /// Returns immediately with cached result if available
     async fn is_command_available(&mut self, command: &str) -> bool {
-        if let Some(&available) = self.cache.get(command) {
+        // Fast path: return cached result if available
+        if let Some(available) = self.is_cached_available(command) {
             return available;
         }
 
+        // Slow path: check command availability and cache the result
         let available = Command::new("which")
             .arg(command)
             .output()
@@ -62,15 +111,21 @@ impl CommandCache {
         command: &str,
         args: &[&str],
     ) -> Option<std::process::Output> {
-        if self.is_command_available(command).await {
-            // Log the command that's about to be executed
-            let cmd_str = format!("{} {}", command, args.join(" "));
-            println!("{} {}", "Executing command:".cyan().bold(), cmd_str.cyan());
-
-            Command::new(command).args(args).output().await.ok()
-        } else {
-            None
+        // Fast path: if we already know the command is unavailable, return None immediately
+        if let Some(false) = self.is_cached_available(command) {
+            return None;
         }
+
+        // Check if command is available (uses cache if possible)
+        if !self.is_command_available(command).await {
+            return None;
+        }
+
+        // Log the command that's about to be executed
+        let cmd_str = format!("{} {}", command, args.join(" "));
+        println!("{} {}", "Executing command:".cyan().bold(), cmd_str.cyan());
+
+        Command::new(command).args(args).output().await.ok()
     }
 }
 
@@ -249,7 +304,13 @@ async fn show_system_info(cmd_cache: &mut CommandCache) -> Result<()> {
 
 /// Handles Flatpak updates
 async fn update_flatpak(cmd_cache: &mut CommandCache) -> Result<bool> {
-    if !cmd_cache.is_command_available("flatpak").await {
+    // Try to use cached result first to avoid async overhead
+    let flatpak_available = match cmd_cache.get_cached_availability("flatpak") {
+        Some(available) => available,
+        None => cmd_cache.is_command_available("flatpak").await,
+    };
+
+    if !flatpak_available {
         println!(
             "{}",
             "Flatpak is not installed. Skipping Flatpak updates.".yellow()
@@ -271,7 +332,13 @@ async fn update_flatpak(cmd_cache: &mut CommandCache) -> Result<bool> {
 
 /// Handles DNF5 updates
 async fn update_dnf5(cmd_cache: &mut CommandCache, interactive: bool) -> Result<bool> {
-    if !cmd_cache.is_command_available("dnf5").await {
+    // Try to use cached result first to avoid async overhead
+    let dnf5_available = match cmd_cache.get_cached_availability("dnf5") {
+        Some(available) => available,
+        None => cmd_cache.is_command_available("dnf5").await,
+    };
+
+    if !dnf5_available {
         println!(
             "{}",
             "DNF5 is not installed. Please install it first.".red()
@@ -357,6 +424,9 @@ async fn main() -> Result<()> {
 
     println!("{}", "Fedora Updater".green().bold());
     println!("─────────────────────────────\n");
+
+    // Preload command availability checks to reduce async overhead later
+    cmd_cache.preload_common_commands().await;
 
     show_system_info(&mut cmd_cache).await?;
     println!("\n{}", "Starting update process...".green());
