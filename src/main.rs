@@ -4,7 +4,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use colored::*;
-use std::collections::HashMap;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -32,27 +31,28 @@ struct Cli {
 /// Struct to manage command availability caching
 #[derive(Debug)]
 struct CommandCache {
-    cache: HashMap<String, bool>,
+    // Use a static array of known commands to avoid heap allocations
+    // This acts as a simple string interning mechanism
+    known_commands: [&'static str; 4],
+    // Store availability as a fixed-size array matching known_commands
+    availability: [Option<bool>; 4],
 }
 
 impl CommandCache {
     fn new() -> Self {
         Self {
-            cache: HashMap::new(),
+            known_commands: ["flatpak", "dnf5", "cat", "uname"],
+            availability: [None, None, None, None],
         }
     }
 
     /// Preloads availability of commonly used commands
     /// Call this at startup to avoid async overhead during actual operations
     async fn preload_common_commands(&mut self) {
-        // List of commonly used commands in this application
-        // Using 'static str to avoid temporary allocations
-        static COMMON_COMMANDS: [&str; 4] = ["flatpak", "dnf5", "cat", "uname"];
-
         // Check commands concurrently with minimum allocations
-        let mut handles = Vec::with_capacity(COMMON_COMMANDS.len());
+        let mut handles = Vec::with_capacity(self.known_commands.len());
 
-        for &cmd in &COMMON_COMMANDS {
+        for (idx, &cmd) in self.known_commands.iter().enumerate() {
             // Spawn a task for each command
             let handle = tokio::spawn(async move {
                 let available = Command::new("which")
@@ -61,7 +61,7 @@ impl CommandCache {
                     .await
                     .map(|output| output.status.success())
                     .unwrap_or(false);
-                (cmd, available)
+                (idx, available)
             });
 
             handles.push(handle);
@@ -69,16 +69,24 @@ impl CommandCache {
 
         // Await all tasks and collect results
         for handle in handles {
-            if let Ok((cmd, available)) = handle.await {
-                // We only allocate strings when we need to store them in the cache
-                self.cache.insert(cmd.to_string(), available);
+            if let Ok((idx, available)) = handle.await {
+                // Store result in our fixed-size array - no heap allocation
+                self.availability[idx] = Some(available);
             }
         }
     }
 
     /// Checks if a command is cached as available
     fn is_cached_available(&self, command: &str) -> Option<bool> {
-        self.cache.get(command).copied()
+        // Check our static array - this is very fast
+        for (idx, &cmd) in self.known_commands.iter().enumerate() {
+            if cmd == command {
+                return self.availability[idx];
+            }
+        }
+
+        // Command not in our known list
+        None
     }
 
     /// Gets the availability of a command, returning immediately if cached
@@ -104,8 +112,16 @@ impl CommandCache {
             .map(|output| output.status.success())
             .unwrap_or(false);
 
-        self.cache.insert(command.to_string(), available);
-        available
+        // Check if this is one of our known commands
+        for (idx, &cmd) in self.known_commands.iter().enumerate() {
+            if cmd == command {
+                self.availability[idx] = Some(available);
+                return available;
+            }
+        }
+
+        // Command not in our known list - return false as we don't support it
+        false
     }
 
     /// Executes a command if it's available, returns None if command is not available
