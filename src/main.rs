@@ -11,8 +11,8 @@ use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc};
 
 /// Pre-allocated buffer capacity for command output strings
-const DEFAULT_OUTPUT_CAPACITY: usize = 4096;
-const DEFAULT_CHANNEL_CAPACITY: usize = 100;
+const DEFAULT_OUTPUT_CAPACITY: usize = 16384;
+const DEFAULT_CHANNEL_CAPACITY: usize = 200;
 const DEFAULT_LINE_CAPACITY: usize = 256;
 const STRING_POOL_SIZE: usize = 32;
 
