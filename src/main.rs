@@ -5,13 +5,16 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use colored::*;
 use std::process::Stdio;
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 
 /// Pre-allocated buffer capacity for command output strings
 const DEFAULT_OUTPUT_CAPACITY: usize = 4096;
 const DEFAULT_CHANNEL_CAPACITY: usize = 100;
+const DEFAULT_LINE_CAPACITY: usize = 256;
+const STRING_POOL_SIZE: usize = 32;
 
 /// Fedora system updater that handles both Flatpak and DNF5 updates
 #[derive(Parser, Debug)]
@@ -155,6 +158,57 @@ enum OutputSource {
     Stderr,
 }
 
+/// A string buffer that can be reused to avoid allocations
+#[derive(Debug)]
+struct StringBuffer {
+    buffer: String,
+}
+
+impl StringBuffer {
+    fn new(capacity: usize) -> Self {
+        Self {
+            buffer: String::with_capacity(capacity),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.buffer.clear();
+    }
+
+    fn as_str(&self) -> &str {
+        &self.buffer
+    }
+}
+
+/// A pool of string buffers that can be reused
+#[derive(Debug)]
+struct StringBufferPool {
+    buffers: Vec<StringBuffer>,
+}
+
+impl StringBufferPool {
+    fn new(size: usize, buffer_capacity: usize) -> Self {
+        let mut buffers = Vec::with_capacity(size);
+        for _ in 0..size {
+            buffers.push(StringBuffer::new(buffer_capacity));
+        }
+        Self { buffers }
+    }
+
+    fn get(&mut self) -> StringBuffer {
+        self.buffers
+            .pop()
+            .unwrap_or_else(|| StringBuffer::new(DEFAULT_LINE_CAPACITY))
+    }
+
+    fn return_buffer(&mut self, mut buffer: StringBuffer) {
+        buffer.clear();
+        if self.buffers.len() < STRING_POOL_SIZE {
+            self.buffers.push(buffer);
+        }
+    }
+}
+
 /// Struct to manage output streams and handle line-by-line output
 #[derive(Debug)]
 struct CommandRunner {
@@ -227,30 +281,56 @@ impl CommandRunner {
         let mut stdout_reader = BufReader::new(stdout).lines();
         let mut stderr_reader = BufReader::new(stderr).lines();
 
-        // Create a channel for output handling with a tuple of source and line
-        // This avoids the enum allocation by using a simple tuple
-        let (tx, rx) = mpsc::channel::<(OutputSource, String)>(DEFAULT_CHANNEL_CAPACITY);
-        let output_handler_task = tokio::spawn(output_handler(rx));
+        // Create a shared buffer pool for output lines
+        let buffer_pool = Arc::new(Mutex::new(StringBufferPool::new(
+            STRING_POOL_SIZE,
+            DEFAULT_LINE_CAPACITY,
+        )));
 
-        // Use a channel-based approach to accumulate output instead of shared mutable state
-        let (line_tx, mut line_rx) = mpsc::channel::<String>(DEFAULT_CHANNEL_CAPACITY);
+        // Create a channel for output handling
+        let (tx, rx) = mpsc::channel(DEFAULT_CHANNEL_CAPACITY);
+        let output_handler_task = tokio::spawn(output_handler(rx, buffer_pool.clone()));
+
+        // Use a channel for accumulating output - now using StringBuffer instead of String
+        let (line_tx, mut line_rx) = mpsc::channel(DEFAULT_CHANNEL_CAPACITY);
 
         // Create separate clones of the sender for each task
         let tx_stdout = tx.clone();
         let line_tx_clone = line_tx.clone();
+        let stdout_pool = buffer_pool.clone();
 
         let stdout_task = tokio::spawn(async move {
             while let Ok(Some(line)) = stdout_reader.next_line().await {
-                // Send the line to our accumulator channel
-                let _ = line_tx_clone.send(line.clone()).await;
-                let _ = tx_stdout.send((OutputSource::Stdout, line)).await;
+                // Get a buffer from the pool for the output handler
+                let mut pool_guard = stdout_pool.lock().await;
+                let mut output_buffer = pool_guard.get();
+                let mut accum_buffer = pool_guard.get();
+                drop(pool_guard); // Release the lock before further operations
+
+                // Fill both buffers with the same content
+                output_buffer.buffer.push_str(&line);
+                accum_buffer.buffer.push_str(&line);
+
+                // Send buffers to their respective channels
+                let _ = line_tx_clone.send(accum_buffer).await;
+                let _ = tx_stdout.send((OutputSource::Stdout, output_buffer)).await;
             }
         });
 
         let tx_stderr = tx.clone();
+        let stderr_pool = buffer_pool.clone();
+
         let stderr_task = tokio::spawn(async move {
             while let Ok(Some(line)) = stderr_reader.next_line().await {
-                let _ = tx_stderr.send((OutputSource::Stderr, line)).await;
+                // Get a buffer from the pool and fill it
+                let mut pool_guard = stderr_pool.lock().await;
+                let mut buffer = pool_guard.get();
+                drop(pool_guard); // Release the lock before further operations
+
+                buffer.buffer.push_str(&line);
+
+                // Send the buffer to the output handler
+                let _ = tx_stderr.send((OutputSource::Stderr, buffer)).await;
             }
         });
 
@@ -269,9 +349,13 @@ impl CommandRunner {
             .context("Failed to join output handler task")?;
 
         // Collect output lines from channel into our pre-allocated buffer
-        while let Some(line) = line_rx.recv().await {
-            self.output_buffer.push_str(&line);
+        while let Some(buffer) = line_rx.recv().await {
+            self.output_buffer.push_str(buffer.as_str());
             self.output_buffer.push('\n');
+
+            // Return the buffer to the pool
+            let mut pool = buffer_pool.lock().await;
+            pool.return_buffer(buffer);
         }
 
         // Return a reference to our buffer to avoid cloning
@@ -452,12 +536,19 @@ impl CommandRunner {
 }
 
 /// Handles printing output messages in a serialized manner
-async fn output_handler(mut rx: mpsc::Receiver<(OutputSource, String)>) {
-    while let Some((source, line)) = rx.recv().await {
+async fn output_handler(
+    mut rx: mpsc::Receiver<(OutputSource, StringBuffer)>,
+    buffer_pool: Arc<Mutex<StringBufferPool>>,
+) {
+    while let Some((source, buffer)) = rx.recv().await {
         match source {
-            OutputSource::Stdout => println!("{} {}", "[stdout]".blue(), line),
-            OutputSource::Stderr => eprintln!("{} {}", "[stderr]".red(), line),
+            OutputSource::Stdout => println!("{} {}", "[stdout]".blue(), buffer.as_str()),
+            OutputSource::Stderr => eprintln!("{} {}", "[stderr]".red(), buffer.as_str()),
         }
+
+        // Return the buffer to the pool
+        let mut pool = buffer_pool.lock().await;
+        pool.return_buffer(buffer);
     }
 }
 
