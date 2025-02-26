@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![deny(warnings)]
 
 use anyhow::{Context, Result};
 use clap::Parser;
