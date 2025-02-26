@@ -1,6 +1,6 @@
 [package]
 name = "fedora-updater"
-version = "1.3.2"
+version = "1.3.3"
 edition = "2024"
 authors = ["khs-kks"]
 repository = "https://github.com/khs-kks/fedora-updater"
