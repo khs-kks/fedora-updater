@@ -241,7 +241,29 @@ impl CommandRunner {
         // Clear the buffer before reusing
         self.output_buffer.clear();
 
-        // Log the command that's about to be executed
+        // Log the command execution
+        self.log_command_execution(command, args, sudo);
+
+        // Setup command and streams
+        let (mut child, stdout, stderr) = self.setup_command_streams(command, args, sudo).await?;
+
+        // Create readers for stdout and stderr
+        let stdout_reader = BufReader::new(stdout).lines();
+        let stderr_reader = BufReader::new(stderr).lines();
+
+        // Process command output
+        self.process_command_output(stdout_reader, stderr_reader)
+            .await?;
+
+        // Wait for the command to complete
+        let status = child.wait().await?;
+
+        // Return a reference to our buffer to avoid cloning
+        Ok((status, &self.output_buffer))
+    }
+
+    /// Logs the command that's about to be executed
+    fn log_command_execution(&self, command: &str, args: &[&str], sudo: bool) {
         // Avoid string allocation by building command display directly
         print!("{} ", "Executing command:".cyan().bold());
         if sudo {
@@ -254,7 +276,19 @@ impl CommandRunner {
             print!("{} ", arg.cyan());
         }
         println!();
+    }
 
+    /// Sets up the command and its input/output streams
+    async fn setup_command_streams(
+        &self,
+        command: &str,
+        args: &[&str],
+        sudo: bool,
+    ) -> Result<(
+        tokio::process::Child,
+        tokio::process::ChildStdout,
+        tokio::process::ChildStderr,
+    )> {
         let mut cmd = if sudo {
             let mut c = Command::new("sudo");
             c.arg(command);
@@ -277,10 +311,15 @@ impl CommandRunner {
         let stdout = child.stdout.take().context("Failed to capture stdout")?;
         let stderr = child.stderr.take().context("Failed to capture stderr")?;
 
-        // Create readers for stdout and stderr
-        let mut stdout_reader = BufReader::new(stdout).lines();
-        let mut stderr_reader = BufReader::new(stderr).lines();
+        Ok((child, stdout, stderr))
+    }
 
+    /// Processes the command output streams
+    async fn process_command_output(
+        &mut self,
+        stdout_reader: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+        stderr_reader: tokio::io::Lines<BufReader<tokio::process::ChildStderr>>,
+    ) -> Result<Arc<Mutex<StringBufferPool>>> {
         // Create a shared buffer pool for output lines
         let buffer_pool = Arc::new(Mutex::new(StringBufferPool::new(
             STRING_POOL_SIZE,
@@ -292,14 +331,52 @@ impl CommandRunner {
         let output_handler_task = tokio::spawn(output_handler(rx, buffer_pool.clone()));
 
         // Use a channel for accumulating output - now using StringBuffer instead of String
-        let (line_tx, mut line_rx) = mpsc::channel(DEFAULT_CHANNEL_CAPACITY);
+        let (line_tx, line_rx) = mpsc::channel(DEFAULT_CHANNEL_CAPACITY);
 
+        // Process stdout and stderr
+        let (stdout_task, stderr_task) = self.spawn_output_processing_tasks(
+            stdout_reader,
+            stderr_reader,
+            tx.clone(),
+            line_tx.clone(),
+            buffer_pool.clone(),
+        );
+
+        // Close senders to signal completion
+        drop(tx);
+        drop(line_tx);
+
+        // Wait for output handling to complete
+        let _ = tokio::try_join!(stdout_task, stderr_task)
+            .context("Failed to join stdout/stderr tasks")?;
+        output_handler_task
+            .await
+            .context("Failed to join output handler task")?;
+
+        // Collect output lines from channel into our pre-allocated buffer
+        self.collect_output_lines(line_rx, buffer_pool.clone())
+            .await;
+
+        // Return the buffer pool for potential reuse
+        Ok(buffer_pool)
+    }
+
+    /// Spawns tasks to process stdout and stderr streams
+    fn spawn_output_processing_tasks(
+        &self,
+        stdout_reader: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+        stderr_reader: tokio::io::Lines<BufReader<tokio::process::ChildStderr>>,
+        tx: mpsc::Sender<(OutputSource, StringBuffer)>,
+        line_tx: mpsc::Sender<StringBuffer>,
+        buffer_pool: Arc<Mutex<StringBufferPool>>,
+    ) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
         // Create separate clones of the sender for each task
         let tx_stdout = tx.clone();
         let line_tx_clone = line_tx.clone();
         let stdout_pool = buffer_pool.clone();
 
         let stdout_task = tokio::spawn(async move {
+            let mut stdout_reader = stdout_reader;
             while let Ok(Some(line)) = stdout_reader.next_line().await {
                 // Get a buffer from the pool for the output handler
                 let mut pool_guard = stdout_pool.lock().await;
@@ -321,6 +398,7 @@ impl CommandRunner {
         let stderr_pool = buffer_pool.clone();
 
         let stderr_task = tokio::spawn(async move {
+            let mut stderr_reader = stderr_reader;
             while let Ok(Some(line)) = stderr_reader.next_line().await {
                 // Get a buffer from the pool and fill it
                 let mut pool_guard = stderr_pool.lock().await;
@@ -334,21 +412,15 @@ impl CommandRunner {
             }
         });
 
-        // Wait for the command to complete
-        let status = child.wait().await?;
+        (stdout_task, stderr_task)
+    }
 
-        // Close senders to signal completion
-        drop(tx);
-        drop(line_tx);
-
-        // Wait for output handling to complete
-        let _ = tokio::try_join!(stdout_task, stderr_task)
-            .context("Failed to join stdout/stderr tasks")?;
-        output_handler_task
-            .await
-            .context("Failed to join output handler task")?;
-
-        // Collect output lines from channel into our pre-allocated buffer
+    /// Collects output lines from the channel into the pre-allocated buffer
+    async fn collect_output_lines(
+        &mut self,
+        mut line_rx: mpsc::Receiver<StringBuffer>,
+        buffer_pool: Arc<Mutex<StringBufferPool>>,
+    ) {
         while let Some(buffer) = line_rx.recv().await {
             self.output_buffer.push_str(buffer.as_str());
             self.output_buffer.push('\n');
@@ -357,9 +429,6 @@ impl CommandRunner {
             let mut pool = buffer_pool.lock().await;
             pool.return_buffer(buffer);
         }
-
-        // Return a reference to our buffer to avoid cloning
-        Ok((status, &self.output_buffer))
     }
 
     /// Displays system information
