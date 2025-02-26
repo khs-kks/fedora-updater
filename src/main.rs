@@ -6,13 +6,13 @@ use clap::Parser;
 use colored::*;
 use std::collections::HashMap;
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
 /// Pre-allocated buffer capacity for command output strings
 const DEFAULT_OUTPUT_CAPACITY: usize = 4096;
+const DEFAULT_CHANNEL_CAPACITY: usize = 100;
 
 /// Fedora system updater that handles both Flatpak and DNF5 updates
 #[derive(Parser, Debug)]
@@ -167,17 +167,23 @@ impl CommandRunner {
         command: &str,
         args: &[&str],
         sudo: bool,
-    ) -> Result<(std::process::ExitStatus, String)> {
+    ) -> Result<(std::process::ExitStatus, &str)> {
         // Clear the buffer before reusing
         self.output_buffer.clear();
 
         // Log the command that's about to be executed
-        let cmd_str = if sudo {
-            format!("sudo {} {}", command, args.join(" "))
-        } else {
-            format!("{} {}", command, args.join(" "))
-        };
-        println!("{} {}", "Executing command:".cyan().bold(), cmd_str.cyan());
+        // Avoid string allocation by building command display directly
+        print!("{} ", "Executing command:".cyan().bold());
+        if sudo {
+            print!("{} ", "sudo".cyan());
+        }
+        print!("{} ", command.cyan());
+
+        // Print arguments directly to avoid join allocation
+        for arg in args {
+            print!("{} ", arg.cyan());
+        }
+        println!();
 
         let mut cmd = if sudo {
             let mut c = Command::new("sudo");
@@ -198,37 +204,33 @@ impl CommandRunner {
             .with_context(|| format!("Failed to execute {} command", command))?;
 
         // Get handles to stdout and stderr
-        let stdout = child.stdout.take().expect("Failed to capture stdout");
-        let stderr = child.stderr.take().expect("Failed to capture stderr");
+        let stdout = child.stdout.take().context("Failed to capture stdout")?;
+        let stderr = child.stderr.take().context("Failed to capture stderr")?;
 
         // Create readers for stdout and stderr
         let mut stdout_reader = BufReader::new(stdout).lines();
         let mut stderr_reader = BufReader::new(stderr).lines();
 
         // Create a channel for output handling
-        let (tx, rx) = mpsc::channel(100); // Buffer size of 100 messages
+        let (tx, rx) = mpsc::channel(DEFAULT_CHANNEL_CAPACITY); // Buffer size for messages
         let output_handler_task = tokio::spawn(output_handler(rx));
 
-        // Process stdout and stderr in parallel
-        let output = Arc::new(Mutex::new(String::with_capacity(DEFAULT_OUTPUT_CAPACITY)));
-        let output_clone = Arc::clone(&output);
+        // Use a channel-based approach to accumulate output instead of shared mutable state
+        let (line_tx, mut line_rx) = mpsc::channel::<String>(DEFAULT_CHANNEL_CAPACITY);
 
         // Create separate clones of the sender for each task
         let tx_stdout = tx.clone();
-        let tx_stderr = tx.clone();
+        let line_tx_clone = line_tx.clone();
 
         let stdout_task = tokio::spawn(async move {
             while let Ok(Some(line)) = stdout_reader.next_line().await {
-                // Store the line for later analysis
-                if let Ok(mut guard) = output_clone.lock() {
-                    guard.push_str(&line);
-                    guard.push('\n');
-                }
-
+                // Send the line to our accumulator channel
+                let _ = line_tx_clone.send(line.clone()).await;
                 let _ = tx_stdout.send(OutputMessage::Stdout(line)).await;
             }
         });
 
+        let tx_stderr = tx.clone();
         let stderr_task = tokio::spawn(async move {
             while let Ok(Some(line)) = stderr_reader.next_line().await {
                 let _ = tx_stderr.send(OutputMessage::Stderr(line)).await;
@@ -238,18 +240,25 @@ impl CommandRunner {
         // Wait for the command to complete
         let status = child.wait().await?;
 
+        // Close senders to signal completion
+        drop(tx);
+        drop(line_tx);
+
         // Wait for output handling to complete
-        drop(tx); // Close the original sender
-        let _ = tokio::try_join!(stdout_task, stderr_task)?;
-        output_handler_task.await?;
+        let _ = tokio::try_join!(stdout_task, stderr_task)
+            .context("Failed to join stdout/stderr tasks")?;
+        output_handler_task
+            .await
+            .context("Failed to join output handler task")?;
 
-        // Extract the result
-        let result = output.lock().expect("Failed to lock output").clone();
+        // Collect output lines from channel into our pre-allocated buffer
+        while let Some(line) = line_rx.recv().await {
+            self.output_buffer.push_str(&line);
+            self.output_buffer.push('\n');
+        }
 
-        // Copy to our reusable buffer for the next caller
-        self.output_buffer = result.clone();
-
-        Ok((status, result))
+        // Return a reference to our buffer to avoid cloning
+        Ok((status, &self.output_buffer))
     }
 
     /// Displays system information
