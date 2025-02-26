@@ -148,11 +148,11 @@ impl CommandCache {
     }
 }
 
-/// Represents a single line of output from a command
-#[derive(Debug)]
-enum OutputMessage {
-    Stdout(String),
-    Stderr(String),
+/// Represents a single line of output from a command with a tag to indicate source
+#[derive(Debug, Clone, Copy)]
+enum OutputSource {
+    Stdout,
+    Stderr,
 }
 
 /// Struct to manage output streams and handle line-by-line output
@@ -227,8 +227,9 @@ impl CommandRunner {
         let mut stdout_reader = BufReader::new(stdout).lines();
         let mut stderr_reader = BufReader::new(stderr).lines();
 
-        // Create a channel for output handling
-        let (tx, rx) = mpsc::channel(DEFAULT_CHANNEL_CAPACITY); // Buffer size for messages
+        // Create a channel for output handling with a tuple of source and line
+        // This avoids the enum allocation by using a simple tuple
+        let (tx, rx) = mpsc::channel::<(OutputSource, String)>(DEFAULT_CHANNEL_CAPACITY);
         let output_handler_task = tokio::spawn(output_handler(rx));
 
         // Use a channel-based approach to accumulate output instead of shared mutable state
@@ -242,14 +243,14 @@ impl CommandRunner {
             while let Ok(Some(line)) = stdout_reader.next_line().await {
                 // Send the line to our accumulator channel
                 let _ = line_tx_clone.send(line.clone()).await;
-                let _ = tx_stdout.send(OutputMessage::Stdout(line)).await;
+                let _ = tx_stdout.send((OutputSource::Stdout, line)).await;
             }
         });
 
         let tx_stderr = tx.clone();
         let stderr_task = tokio::spawn(async move {
             while let Ok(Some(line)) = stderr_reader.next_line().await {
-                let _ = tx_stderr.send(OutputMessage::Stderr(line)).await;
+                let _ = tx_stderr.send((OutputSource::Stderr, line)).await;
             }
         });
 
@@ -451,11 +452,11 @@ impl CommandRunner {
 }
 
 /// Handles printing output messages in a serialized manner
-async fn output_handler(mut rx: mpsc::Receiver<OutputMessage>) {
-    while let Some(message) = rx.recv().await {
-        match message {
-            OutputMessage::Stdout(line) => println!("{} {}", "[stdout]".blue(), line),
-            OutputMessage::Stderr(line) => eprintln!("{} {}", "[stderr]".red(), line),
+async fn output_handler(mut rx: mpsc::Receiver<(OutputSource, String)>) {
+    while let Some((source, line)) = rx.recv().await {
+        match source {
+            OutputSource::Stdout => println!("{} {}", "[stdout]".blue(), line),
+            OutputSource::Stderr => eprintln!("{} {}", "[stderr]".red(), line),
         }
     }
 }
