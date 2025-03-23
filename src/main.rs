@@ -626,7 +626,11 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let mut cmd_runner = CommandRunner::new();
 
-    println!("{}", "Fedora Updater".green().bold());
+    println!(
+        "{} {}",
+        "Fedora Updater".green().bold(),
+        format!("v{}", env!("CARGO_PKG_VERSION")).yellow()
+    );
     println!("─────────────────────────────\n");
 
     // Preload command availability checks to reduce async overhead later
