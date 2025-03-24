@@ -14,6 +14,7 @@ A command-line utility to streamline system updates on Fedora through both Flatp
 - **Update Options**:
   - DNF5: Supports both immediate and offline updates
   - Flatpak: Automatic updates with clear progress indication
+- **Build Information**: Displays build date dynamically set during compilation
 
 ## Requirements
 

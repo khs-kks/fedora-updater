@@ -22,7 +22,7 @@ const STRING_POOL_SIZE: usize = 32;
     author = "khs-kks",
     version,
     about = "A command-line utility to update Fedora systems through Flatpak and DNF5",
-    after_help = "Repository: https://github.com/khs-kks/fedora-updater\nBuild Date: Feb 2025",
+    after_help = concat!("Repository: https://github.com/khs-kks/fedora-updater\nBuild Date: ", env!("CARGO_BUILD_DATE")),
     help_template = "{about}\n\nUsage: {name} [OPTIONS]\n\nOptions:\n{options}\n\nAuthor: {author}{after-help}"
 )]
 struct Cli {
